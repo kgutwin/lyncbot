@@ -17,12 +17,16 @@ ssl._create_default_https_context = ssl._create_unverified_context
 #      - takes each emitted event
 #      - walks down the self.application tree and updates the local data model
 #      - invokes any callbacks registered to individual elements of the model
+# 3. Build a callback system
 
 class UCWAResource(dict):
     def __init__(self, *args, **kwargs):
-        dict.__init__(self, args[0])
+        dict.__init__(self)
         self._ucwa = kwargs['ucwa']
+        self.update(args[0])
         
+    def update(self, other):
+        dict.update(self, other)
         for link in self.get('_links', {}):
             if link == 'self':
                 continue
@@ -69,6 +73,12 @@ class UCWAResource(dict):
         j = json.load(req)
         self.clear()
         self.__init__(j, ucwa=ucwa)
+
+    def add_link(self, rel, href):
+        # nope, can't do it this way
+        self.update({'_links': {rel: {'href': href}}})
+
+    def del_link(self, rel, href)
         
 
 class UCWAIterator:
@@ -79,7 +89,7 @@ class UCWAIterator:
         cur = self.initial
         yield self.initial
         while hasattr(cur, 'next'):
-            cur = cur.next()
+            cur = cur.next
             yield cur
         
 
@@ -173,9 +183,33 @@ class LyncUCWA:
         }
         return self.application.me.makeMeAvailable(POST=request_body)
 
-    def listen(self):
-        """Listen for UCWA events."""
-        return self.application.events()
+    def _parse_href(self, href):
+        hbase = urlparse.urlparse(self.appbase).path
+        assert href.startswith(hbase)
+        if href == hbase:
+            return []
+        return href[len(hbase)+1:].split('/')
+    
+    def process_events(self):
+        """Handle incoming UCWA events by updating the local data model."""
+        for event in self.application.events():
+            for sender in event['sender']:
+                for subevent in sender['events']:
+                    recip = self.application
+                    href = os.path.basename(subevent['link']['href'])
+                    for el in self._parse_href(href):
+                        recip = getattr(recip, el)
+                    if subevent['type'] == 'updated':
+                        if '_embedded' in subevent:
+                            pass
+                        recip.refresh()
+                    elif subevent['type'] == 'added':
+                        recip.add_link(subevent['link']['rel'],
+                                       subevent['link']['href'])
+                        # optionally process embedded
+                    elif subevent['type'] == 'deleted':
+                        recip.del_link(subevent['link']['rel'],
+                                       subevent['link']['href'])
         
     
 if __name__ == "__main__":
