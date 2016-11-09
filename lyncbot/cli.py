@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
 
 import click
+import .lyncbot
 
 @click.command()
 def main(args=None):
-    """Console script for lyncbot"""
-    click.echo("Replace this message by putting your code into "
-                "lyncbot.cli.main")
-    click.echo("See click documentation at http://click.pocoo.org/")
-
+    pass
+    
+    
 
 if __name__ == "__main__":
     main()
