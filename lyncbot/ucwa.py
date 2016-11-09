@@ -11,6 +11,18 @@ import ssl
 ssl._create_default_https_context = ssl._create_unverified_context
 ###
 
+# Things to do:
+# 1. Refactor UCWAResource to:
+#    - not add closures for links but to instead build 'auto-filling' objects
+#      by overriding __getattr__
+#    - represent GET and POST actions by __call__
+#    - abandon the dict core class??
+# 2. Build an events system
+#    - refactor LyncUCWA.listen() to a process_events() call that:
+#      - takes each emitted event
+#      - walks down the self.application tree and updates the local data model
+#      - invokes any callbacks registered to individual elements of the model
+
 class UCWAResource(dict):
     def __init__(self, *args, **kwargs):
         dict.__init__(self, args[0])
@@ -19,13 +31,15 @@ class UCWAResource(dict):
         for link in self.get('_links', {}):
             if link == 'self':
                 continue
-            def link_closure(href=self['_links'][link]['href'], POST=None,
-                             **kwargs):
-                if kwargs:
-                    href += "?" + urllib.urlencode(kwargs)
-                return self._get_url(href, POST)
-            link_closure.__name__ = str(link)
-            setattr(self, link, link_closure)
+            #def link_closure(href=self['_links'][link]['href'], POST=None,
+            #                 **kwargs):
+            #    if kwargs:
+            #        href += "?" + urllib.urlencode(kwargs)
+            #    return self._get_url(href, POST)
+            #link_closure.__name__ = str(link)
+            #setattr(self, link, link_closure)
+            stub = {'_links': {'self': {'href': self['_links'][link]['href']}}}
+            setattr(self, link, UCWAResource(stub, ucwa=self._ucwa))
 
         for embed in self.get('_embedded', {}):
             value = self['_embedded'][embed]
@@ -35,9 +49,20 @@ class UCWAResource(dict):
             else:
                 setattr(self, embed, UCWAResource(value, ucwa=self._ucwa))
 
-    def _get_url(self, url, data):
-        url = self._ucwa.appbase + url
-        req = urllib2.urlopen(self._ucwa._request(url, data))
+    def __getattribute__(self, name):
+        if name in self.__dict__:
+            a = object.__getattribute__(self, name)
+            if (isinstance(a, UCWAResource) and a.keys() == ['_links'] and
+                a['_links'].keys() == ['self']):
+                # it's a stub, refresh it before we hand it back
+                a.refresh()
+        return object.__getattribute__(self, name)
+                
+    def __call__(self, POST=None, **kwargs):
+        url = self._ucwa.appbase + self['_links']['self']['href']
+        if kwargs:
+            url += "?" + urllib.urlencode(kwargs)
+        req = urllib2.urlopen(self._ucwa._request(url, POST))
         try:
             res = UCWAResource(json.load(req), ucwa=self._ucwa)
         except ValueError:
