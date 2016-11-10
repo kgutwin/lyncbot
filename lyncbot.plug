@@ -1,0 +1,13 @@
+[Core]
+name = Lyncbot
+module = bot
+
+[Documentation]
+description = Lync (Skype for Business) integration
+
+[Python]
+version = 3
+
+[Errbot]
+min = 4.3.4
+

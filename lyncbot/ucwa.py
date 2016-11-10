@@ -1,10 +1,21 @@
+from __future__ import print_function
 
 import re
 import json
 import uuid
-import urllib
-import urllib2
-import urlparse
+import codecs
+#import urllib
+try:
+    from urllib.error import HTTPError
+    from urllib.request import urlopen, Request
+    from urllib.parse import urlparse, urlunparse, urlencode
+except ImportError:
+    from urllib import urlencode
+    from urllib2 import HTTPError, urlopen, Request
+    from urlparse import urlparse, urlunparse
+    input = raw_input
+
+utfr = codecs.getreader('utf-8')
 
 ### TERRIBLE MONKEY PATCH TO AVOID SSL CERT ISSUE
 import ssl
@@ -47,10 +58,14 @@ class UCWAResource(dict):
                 setattr(self, embed, UCWAResource(value, ucwa=self._ucwa))
 
     def __getattr__(self, name):
-        if self.keys() == ['_links'] and self['_links'].keys() == ['self']:
+        if (list(self.keys()) == ['_links'] and
+            list(self['_links'].keys()) == ['self']):
             # we're a stub, refresh before proceeding
             self.refresh()
-        return self.__getattribute__(name)
+        if name in self:
+            return self[name]
+        else:
+            return self.__getattribute__(name)
                 
     def __call__(self, POST=None, **kwargs):
         return self._get_url(self['_links']['self']['href'], POST=POST,
@@ -59,7 +74,7 @@ class UCWAResource(dict):
     def _get_url(self, url, POST=None, **kwargs):
         url = self._ucwa.appbase + url
         if kwargs:
-            url += "?" + urllib.urlencode(kwargs)
+            url += "?" + urlencode(kwargs)
 
         mode = 'json'
         if POST is True:
@@ -67,10 +82,10 @@ class UCWAResource(dict):
             mode = 'raw'
         elif isinstance(POST, str):
             mode = 'plain'
-        req = urllib2.urlopen(self._ucwa._request(url, POST, mode))
+        req = urlopen(self._ucwa._request(url, POST, mode))
 
         try:
-            res = UCWAResource(json.load(req), ucwa=self._ucwa)
+            res = UCWAResource(json.load(utfr(req)), ucwa=self._ucwa)
         except ValueError:
             return None
         
@@ -82,8 +97,8 @@ class UCWAResource(dict):
     def refresh(self):
         ucwa = self._ucwa
         url = ucwa.appbase + self['_links']['self']['href']
-        req = urllib2.urlopen(ucwa._request(url))
-        j = json.load(req)
+        req = urlopen(ucwa._request(url))
+        j = json.load(utfr(req))
         self.clear()
         self.__init__(j, ucwa=ucwa)
 
@@ -109,7 +124,7 @@ class LyncUCWA:
         # Look up discovery URL and user URL
         domain = username[username.find('@')+1:]
         discover_url = "https://lyncdiscover.%s/" % domain
-        discover_json = json.load(urllib2.urlopen(discover_url))
+        discover_json = json.load(utfr(urlopen(discover_url)))
         self.user_url = discover_json['_links']['user']['href']
 
         self.login(username, password)
@@ -122,29 +137,33 @@ class LyncUCWA:
                 headers['Content-Type'] = 'application/json'
                 headers['Content-Length'] = len(data)
             elif mode == 'urlenc':
-                data = urllib.urlencode(data)
+                data = urlencode(data)
             elif mode == 'html':
                 headers['Content-Type'] = 'text/html'
                 headers['Content-Length'] = len(data)
             elif mode == 'plain':
                 headers['Content-Type'] = 'text/plain'
                 headers['Content-Length'] = len(data)
-        return urllib2.Request(url, data, headers=self.auth_headers)
+            data = bytes(data, 'utf-8')
+        return Request(url, data, headers=self.auth_headers)
         
     def login(self, username, password):
         # Ping the user URL, expecting a 401 and address of oauth server
         try:
-            user_response = urllib2.urlopen(self.user_url)
-        except urllib2.HTTPError, error_response:
-            wwwauth_header = error_response.info()['www-authenticate']
+            user_response = urlopen(self.user_url)
+        except HTTPError as error_response:
+            wwwauth_header = str(error_response.info())
         auth_url_re = re.search('MsRtcOAuth href="([^"]*)"', wwwauth_header)
-        auth_url = auth_url_re.group(1)
+        try:
+            auth_url = auth_url_re.group(1)
+        except AttributeError:
+            raise AttributeError("missing auth_url in %s" % repr(wwwauth_header))
 
         # verify domain
-        user_url_parse = urlparse.urlparse(self.user_url)
-        auth_url_parse = urlparse.urlparse(auth_url)
+        user_url_parse = urlparse(self.user_url)
+        auth_url_parse = urlparse(auth_url)
         if user_url_parse[1] != auth_url_parse[1]:
-            self.user_url = urlparse.urlunparse(
+            self.user_url = urlunparse(
                 [user_url_parse[0], auth_url_parse[1]] + list(user_url_parse[2:])
                 )
             self.login(username, password)
@@ -155,9 +174,9 @@ class LyncUCWA:
             'username': username,
             'password': password
             }
-        auth_request = urllib2.urlopen(auth_url,
-                                       data=urllib.urlencode(auth_data))
-        access_token = json.load(auth_request)
+        auth_request = urlopen(auth_url, data=bytes(urlencode(auth_data),
+                                                    'utf-8'))
+        access_token = json.load(utfr(auth_request))
 
         # Resend user request with oauth headers, get applications url
         self.auth_headers = {
@@ -165,31 +184,43 @@ class LyncUCWA:
                                       access_token['access_token'])),
             'Content-Type': 'application/json'
             }
-        app_request = urllib2.urlopen(self._request(self.user_url))
-        app_url = json.load(app_request)['_links']['applications']['href']
+        app_request = urlopen(self._request(self.user_url))
+        app_url = json.load(utfr(app_request))['_links']['applications']['href']
         app_data = {
             'culture': 'en-US',
             'endpointId': str(uuid.uuid1()),
-            'userAgent': 'fooApp/1.0 (Linux)'
+            'userAgent': 'lyncbotApp/1.0 (Linux)'
             }
 
         # verify domain again
-        app_url_parse = urlparse.urlparse(app_url)
+        app_url_parse = urlparse(app_url)
         if user_url_parse[1] != app_url_parse[1]:
-            self.user_url = urlparse.urlunparse(
+            self.user_url = urlunparse(
                 [user_url_parse[0], app_url_parse[1]] + list(user_url_parse[2:])
                 )
             self.login(username, password)
 
-        self.application_json = json.load(urllib2.urlopen(
-            self._request(app_url, app_data)))
-        self.appbase = urlparse.urlunparse(
-            urlparse.urlparse(app_url)[:2] + ('',) * 4)
+        self.application_json = json.load(utfr(urlopen(
+            self._request(app_url, app_data))))
+        self.appbase = urlunparse(
+            urlparse(app_url)[:2] + ('',) * 4)
         self.application = UCWAResource(self.application_json, ucwa=self)
         
     def search(self, query):
         return self.application.people.search(query=query)
 
+    def contacts(self, query=None):
+        # TODO: add groups support?
+        all_contacts = self.application.people.myContacts.contact
+        if query is not None:
+            if '@' in query:
+                return [c for c in all_contacts if query in c.emailAddresses]
+            else:
+                return [c for c in all_contacts
+                        if c.name.lower().startswith(query.lower())]
+        else:
+            return all_contacts
+    
     def set_available(self, avail=True):
         request_body = {
             'signInAs': 'Online' if avail else 'Away',
@@ -199,7 +230,7 @@ class LyncUCWA:
         return self.application.me.makeMeAvailable(POST=request_body)
 
     def _parse_href(self, href):
-        hbase = urlparse.urlparse(self.appbase).path
+        hbase = urlparse(self.appbase).path
         assert href.startswith(hbase)
         if href == hbase:
             return []
@@ -211,7 +242,6 @@ class LyncUCWA:
     def process_events(self):
         """Handle incoming UCWA events by updating the local data model."""
         for event in self.application.events():
-            print event
             for sender in event['sender']:
                 for ev in sender['events']:
                     ev = UCWAResource(ev, ucwa=self)
@@ -226,30 +256,30 @@ class LyncUCWA:
     
 if __name__ == "__main__":
     import getpass
-    username = raw_input("Username (email): ")
+    username = input("Username (email): ")
     password = getpass.getpass()
 
-    http_logger = urllib2.HTTPHandler(debuglevel=1)
-    opener = urllib2.build_opener(http_logger)
-    urllib2.install_opener(opener)
+    #http_logger = urllib2.HTTPHandler(debuglevel=1)
+    #opener = urllib2.build_opener(http_logger)
+    #urllib2.install_opener(opener)
 
     try:
         l = LyncUCWA(username, password)
         c = l.search(username)
         #c = l.search('Rajesh')
         for contact in c.contact:
-            print contact.contactPresence()
+            print(contact.contactPresence())
 
         # set available and listen for events
         l.set_available()
 
         def printer(u, event):
-            print event.communication['supportedMessageFormats']
+            print(event.communication['supportedMessageFormats'])
         l.register_callback(('communication', 'communication'), printer)
 
         def accept_and_respond(u, event):
-            print getattr(event.messagingInvitation, 'from')['name']
-            print event.messagingInvitation.message
+            print(getattr(event.messagingInvitation, 'from')['name'])
+            print(event.messagingInvitation.message)
             # respond with acceptance
             event.accept(POST=True)
             event.messaging.sendMessage("Hi!")
@@ -257,13 +287,13 @@ if __name__ == "__main__":
                              'started'), accept_and_respond)
 
         def print_conversation_state(u, event):
-            print event['state']
+            print(event['state'])
         l.register_callback(('communication', 'conversation'),
                             print_conversation_state)
         
         l.process_events()
 
-    except urllib2.HTTPError, e:
-        print e
-        print e.read()
+    except HTTPError as e:
+        print(e)
+        print(e.read())
         
