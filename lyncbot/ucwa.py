@@ -4,12 +4,13 @@ import re
 import json
 import uuid
 import codecs
-#import urllib
+
 try:
     from urllib.error import HTTPError
     from urllib.request import urlopen, Request
     from urllib.parse import urlparse, urlunparse, urlencode
 except ImportError:
+    # for temporary py2/3 compatibility
     from urllib import urlencode
     from urllib2 import HTTPError, urlopen, Request
     from urlparse import urlparse, urlunparse
@@ -31,6 +32,13 @@ ssl._create_default_https_context = ssl._create_unverified_context
 # 3. Build a callback system
 
 class UCWAResource(dict):
+    # some links or properties map to Python reserved words; these are
+    # synonyms.
+    RESERVED_ALT = {
+        'from': 'frm'
+    }
+    RESERVED_ALT_REV = dict(zip(RESERVED_ALT.values(), RESERVED_ALT.keys()))
+
     def __init__(self, *args, **kwargs):
         dict.__init__(self)
         self._ucwa = kwargs['ucwa']
@@ -42,13 +50,18 @@ class UCWAResource(dict):
             if link == 'self':
                 continue
             href = self['_links'][link]['href']
+            new_attr = None
             if href.startswith('/'):
                 stub = {'_links': {'self': {'href': href}}}
-                setattr(self, link, UCWAResource(stub, ucwa=self._ucwa))
+                new_attr = UCWAResource(stub, ucwa=self._ucwa)
             elif href.startswith('data:'):
                 # TODO: decode data here
-                setattr(self, link, href)
-
+                new_attr = href
+            if new_attr is not None:
+                setattr(self, link, new_attr)
+                if link in self.RESERVED_ALT:
+                    setattr(self, self.RESERVED_ALT[link], new_attr)
+                
         for embed in self.get('_embedded', {}):
             value = self['_embedded'][embed]
             if isinstance(value, list):
@@ -64,6 +77,8 @@ class UCWAResource(dict):
             self.refresh()
         if name in self:
             return self[name]
+        elif name in self.RESERVED_ALT_REV:
+            return self[self.RESERVED_ALT_REV[name]]
         else:
             return self.__getattribute__(name)
                 
@@ -278,7 +293,7 @@ if __name__ == "__main__":
         l.register_callback(('communication', 'communication'), printer)
 
         def accept_and_respond(u, event):
-            print(getattr(event.messagingInvitation, 'from')['name'])
+            print(getattr(event.messagingInvitation, 'from').name)
             print(event.messagingInvitation.message)
             # respond with acceptance
             event.accept(POST=True)
@@ -287,7 +302,7 @@ if __name__ == "__main__":
                              'started'), accept_and_respond)
 
         def print_conversation_state(u, event):
-            print(event['state'])
+            print(event.state)
         l.register_callback(('communication', 'conversation'),
                             print_conversation_state)
         
