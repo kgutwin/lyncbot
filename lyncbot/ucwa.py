@@ -30,8 +30,13 @@ class UCWAResource(dict):
         for link in self.get('_links', {}):
             if link == 'self':
                 continue
-            stub = {'_links': {'self': {'href': self['_links'][link]['href']}}}
-            setattr(self, link, UCWAResource(stub, ucwa=self._ucwa))
+            href = self['_links'][link]['href']
+            if href.startswith('/'):
+                stub = {'_links': {'self': {'href': href}}}
+                setattr(self, link, UCWAResource(stub, ucwa=self._ucwa))
+            elif href.startswith('data:'):
+                # TODO: decode data here
+                setattr(self, link, href)
 
         for embed in self.get('_embedded', {}):
             value = self['_embedded'][embed]
@@ -45,7 +50,7 @@ class UCWAResource(dict):
         if self.keys() == ['_links'] and self['_links'].keys() == ['self']:
             # we're a stub, refresh before proceeding
             self.refresh()
-        return object.__getattr__(self, name)
+        return self.__getattribute__(name)
                 
     def __call__(self, POST=None, **kwargs):
         return self._get_url(self['_links']['self']['href'], POST=POST,
@@ -55,7 +60,15 @@ class UCWAResource(dict):
         url = self._ucwa.appbase + url
         if kwargs:
             url += "?" + urllib.urlencode(kwargs)
-        req = urllib2.urlopen(self._ucwa._request(url, POST))
+
+        mode = 'json'
+        if POST is True:
+            POST = ''
+            mode = 'raw'
+        elif isinstance(POST, str):
+            mode = 'plain'
+        req = urllib2.urlopen(self._ucwa._request(url, POST, mode))
+
         try:
             res = UCWAResource(json.load(req), ucwa=self._ucwa)
         except ValueError:
@@ -74,12 +87,6 @@ class UCWAResource(dict):
         self.clear()
         self.__init__(j, ucwa=ucwa)
 
-    def add_link(self, rel, href):
-        # nope, can't do it this way
-        self.update({'_links': {rel: {'href': href}}})
-
-    def del_link(self, rel, href)
-        
 
 class UCWAIterator:
     def __init__(self, initial):
@@ -90,13 +97,15 @@ class UCWAIterator:
         yield self.initial
         while hasattr(cur, 'next'):
             cur = cur.next
+            cur.refresh()
             yield cur
         
 
 class LyncUCWA:
     def __init__(self, username, password):
         self.auth_headers = None
-
+        self.callbacks = {}
+        
         # Look up discovery URL and user URL
         domain = username[username.find('@')+1:]
         discover_url = "https://lyncdiscover.%s/" % domain
@@ -114,6 +123,12 @@ class LyncUCWA:
                 headers['Content-Length'] = len(data)
             elif mode == 'urlenc':
                 data = urllib.urlencode(data)
+            elif mode == 'html':
+                headers['Content-Type'] = 'text/html'
+                headers['Content-Length'] = len(data)
+            elif mode == 'plain':
+                headers['Content-Type'] = 'text/plain'
+                headers['Content-Length'] = len(data)
         return urllib2.Request(url, data, headers=self.auth_headers)
         
     def login(self, username, password):
@@ -189,27 +204,24 @@ class LyncUCWA:
         if href == hbase:
             return []
         return href[len(hbase)+1:].split('/')
+
+    def register_callback(self, rel, callback):
+        self.callbacks.setdefault(rel, []).append(callback)
     
     def process_events(self):
         """Handle incoming UCWA events by updating the local data model."""
         for event in self.application.events():
+            print event
             for sender in event['sender']:
-                for subevent in sender['events']:
-                    recip = self.application
-                    href = os.path.basename(subevent['link']['href'])
-                    for el in self._parse_href(href):
-                        recip = getattr(recip, el)
-                    if subevent['type'] == 'updated':
-                        if '_embedded' in subevent:
-                            pass
-                        recip.refresh()
-                    elif subevent['type'] == 'added':
-                        recip.add_link(subevent['link']['rel'],
-                                       subevent['link']['href'])
-                        # optionally process embedded
-                    elif subevent['type'] == 'deleted':
-                        recip.del_link(subevent['link']['rel'],
-                                       subevent['link']['href'])
+                for ev in sender['events']:
+                    ev = UCWAResource(ev, ucwa=self)
+                    callbacks = self.callbacks.get(sender['rel'], [])
+                    callbacks += self.callbacks.get(
+                        (sender['rel'], ev['link']['rel']), [])
+                    callbacks += self.callbacks.get(
+                        (sender['rel'], ev['link']['rel'], ev['type']), [])
+                    for callback in callbacks:
+                        callback(self, ev)
         
     
 if __name__ == "__main__":
@@ -230,10 +242,26 @@ if __name__ == "__main__":
 
         # set available and listen for events
         l.set_available()
-        for event in l.listen():
-            print json.dumps(event, indent=2)
-            # TODO: at this point the UCWAResource object has no
-            # specific support for events
+
+        def printer(u, event):
+            print event.communication['supportedMessageFormats']
+        l.register_callback(('communication', 'communication'), printer)
+
+        def accept_and_respond(u, event):
+            print getattr(event.messagingInvitation, 'from')['name']
+            print event.messagingInvitation.message
+            # respond with acceptance
+            event.accept(POST=True)
+            event.messaging.sendMessage("Hi!")
+        l.register_callback(('communication', 'messagingInvitation',
+                             'started'), accept_and_respond)
+
+        def print_conversation_state(u, event):
+            print event['state']
+        l.register_callback(('communication', 'conversation'),
+                            print_conversation_state)
+        
+        l.process_events()
 
     except urllib2.HTTPError, e:
         print e
