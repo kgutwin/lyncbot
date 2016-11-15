@@ -3,16 +3,17 @@ from __future__ import print_function
 import re
 import json
 import uuid
+import base64
 import codecs
 
 try:
-    from urllib.error import HTTPError
+    from urllib.error import HTTPError, URLError
     from urllib.request import urlopen, Request
     from urllib.parse import urlparse, urlunparse, urlencode
 except ImportError:
     # for temporary py2/3 compatibility
     from urllib import urlencode
-    from urllib2 import HTTPError, urlopen, Request
+    from urllib2 import HTTPError, URLError, urlopen, Request
     from urlparse import urlparse, urlunparse
     input = raw_input
 
@@ -42,7 +43,10 @@ class UCWAResource(dict):
     def __init__(self, *args, **kwargs):
         dict.__init__(self)
         self._ucwa = kwargs['ucwa']
-        self.update(args[0])
+        if 'href' in kwargs:
+            self.update({'_links': {'self': {'href': kwargs['href']}}})
+        else:
+            self.update(args[0])
         
     def update(self, other):
         dict.update(self, other)
@@ -52,8 +56,7 @@ class UCWAResource(dict):
             href = self['_links'][link]['href']
             new_attr = None
             if href.startswith('/'):
-                stub = {'_links': {'self': {'href': href}}}
-                new_attr = UCWAResource(stub, ucwa=self._ucwa)
+                new_attr = UCWAResource(href=href, ucwa=self._ucwa)
             elif href.startswith('data:'):
                 # TODO: decode data here
                 new_attr = href
@@ -98,16 +101,15 @@ class UCWAResource(dict):
         elif isinstance(POST, str):
             mode = 'plain'
         req = urlopen(self._ucwa._request(url, POST, mode))
-
-        try:
-            res = UCWAResource(json.load(utfr(req)), ucwa=self._ucwa)
-        except ValueError:
-            return None
         
-        if hasattr(res, 'next'):
-            return UCWAIterator(res)
-        else:
-            return res
+        if req.getheader('Content-Type') == 'application/json':
+            res = UCWAResource(json.load(utfr(req)), ucwa=self._ucwa)
+            if hasattr(res, 'next'):
+                return UCWAIterator(res)
+            else:
+                return res
+        elif req.getheader('Location'):
+            return req.getheader('Location')
 
     def refresh(self):
         ucwa = self._ucwa
@@ -131,6 +133,44 @@ class UCWAIterator:
             yield cur
         
 
+class UCWAConversation:
+    def __init__(self, ucwa, other):
+        self.ucwa = ucwa
+        self.other = other
+        self.conversation = None
+        self.inbound_callback = None
+        self.invite_message = None
+
+    def send(self, message):
+        if self.conversation is not None:
+            self.conversation.messaging.sendMessage(POST=message)
+        else:
+            msg_b64 = base64.b64encode(message)
+            loc = ucwa.application.communication.startMessaging(POST={
+                "to": "sip:" + self.other[0],
+                "_links": {
+                    "message": {
+                        "href": "data:text/plain;base64,%s" % msg_b64
+                    }
+                }
+            })
+            if not loc:
+                raise Exception("failed to send messagingInvitation")
+            invite = UCWAResource(href=loc, ucwa=self.ucwa)
+            self.conversation = invite.conversation
+            # TODO: if len(other) > 1, invite others
+            self.ucwa.register_callback(self._inbound_message, 'conversation',
+                                        link_rel='message')
+
+    def set_inbound_callback(self, cb):
+        self.inbound_callback = cb
+
+    def _inbound_message(self, u, event):
+        sender = event.message.contact.name.split()[0]
+        message = "%s: %s" % (sender, event.message.plainMessage)
+        self.inbound_callback(message)
+
+
 class LyncUCWA:
     def __init__(self, username, password):
         self.auth_headers = None
@@ -139,7 +179,11 @@ class LyncUCWA:
         # Look up discovery URL and user URL
         domain = username[username.find('@')+1:]
         discover_url = "https://lyncdiscover.%s/" % domain
-        discover_json = json.load(utfr(urlopen(discover_url)))
+        try:
+            discover_json = json.load(utfr(urlopen(discover_url)))
+        except URLError:
+            raise Exception("could not contact discovery url %s" %
+                            discover_url)
         self.user_url = discover_json['_links']['user']['href']
 
         self.login(username, password)
@@ -222,7 +266,7 @@ class LyncUCWA:
         self.application = UCWAResource(self.application_json, ucwa=self)
         
     def search(self, query):
-        return self.application.people.search(query=query)
+        return self.application.people.search(query=query).contact
 
     def contacts(self, query=None):
         # TODO: add groups support?
@@ -251,7 +295,45 @@ class LyncUCWA:
             return []
         return href[len(hbase)+1:].split('/')
 
-    def register_callback(self, rel, callback):
+    def normalize_contact(self, name):
+        if isinstance(name, list):
+            name = " ".join(name)
+        # TODO: check if name matches email regex, if so, return directly
+        hits = self.contacts(name)
+        if not hits:
+            hits = list(self.search(name))
+        if not hits:
+            raise Exception("couldn't find %s" % name)
+        hits = [h.email for h in hits]
+        if len(hits) != 1:
+            raise Exception("the name %s was ambiguous - found %s" %
+                            (name, ", ".join(hits)))
+        return hits[0]
+
+    def new_conversation(self, other):
+        return UCWAConversation(self, other)
+
+    def set_invitation_callback(self, cb):
+        def invite_callback(u, event):
+            other = getattr(event.messagingInvitation, 'from')\
+                .uri.split(':')[1]
+            event.accept(POST=True)
+            conversation = UCWAConversation(u, other)
+            conversation.conversation = event.conversation
+            conversation.invite_message = event.messagingInvitation.message
+            cb(conversation)
+
+        self.register_callback(invite_callback, 'communication',
+                               link_rel='messagingInvitation',
+                               ev_type='started')
+
+    def register_callback(self, callback, rel, link_rel=None, ev_type=None):
+        rel = [rel]
+        if link_rel is not None:
+            rel.append(link_rel)
+            if ev_type is not None:
+                rel.append(ev_type)
+        rel = tuple(rel)
         self.callbacks.setdefault(rel, []).append(callback)
     
     def process_events(self):
@@ -282,7 +364,7 @@ if __name__ == "__main__":
         l = LyncUCWA(username, password)
         c = l.search(username)
         #c = l.search('Rajesh')
-        for contact in c.contact:
+        for contact in c:
             print(contact.contactPresence())
 
         # set available and listen for events
@@ -290,7 +372,7 @@ if __name__ == "__main__":
 
         def printer(u, event):
             print(event.communication['supportedMessageFormats'])
-        l.register_callback(('communication', 'communication'), printer)
+        l.register_callback(printer, 'communication', link_rel='communication')
 
         def accept_and_respond(u, event):
             print(getattr(event.messagingInvitation, 'from').name)
@@ -298,13 +380,14 @@ if __name__ == "__main__":
             # respond with acceptance
             event.accept(POST=True)
             event.messaging.sendMessage("Hi!")
-        l.register_callback(('communication', 'messagingInvitation',
-                             'started'), accept_and_respond)
+        l.register_callback(accept_and_respond, 'communication',
+                            link_rel='messagingInvitation',
+                            ev_type='started')
 
         def print_conversation_state(u, event):
             print(event.state)
-        l.register_callback(('communication', 'conversation'),
-                            print_conversation_state)
+        l.register_callback(print_conversation_state,
+                            'communication', link_rel='conversation')
         
         l.process_events()
 
