@@ -5,6 +5,9 @@ import json
 import uuid
 import base64
 import codecs
+import logging
+
+log = logging.getLogger(__name__)
 
 try:
     from urllib.error import HTTPError, URLError
@@ -101,8 +104,8 @@ class UCWAResource(dict):
         elif isinstance(POST, str):
             mode = 'plain'
         req = urlopen(self._ucwa._request(url, POST, mode))
-        
-        if req.getheader('Content-Type') == 'application/json':
+
+        if req.getheader('Content-Type', '').startswith('application/json'):
             res = UCWAResource(json.load(utfr(req)), ucwa=self._ucwa)
             if hasattr(res, 'next'):
                 return UCWAIterator(res)
@@ -338,9 +341,11 @@ class LyncUCWA:
     
     def process_events(self):
         """Handle incoming UCWA events by updating the local data model."""
+        log.debug("Listening for events")
         for event in self.application.events():
             for sender in event['sender']:
                 for ev in sender['events']:
+                    log.debug("Event: %s rel=%s" % (repr(ev), sender['rel']))
                     ev = UCWAResource(ev, ucwa=self)
                     callbacks = self.callbacks.get(sender['rel'], [])
                     callbacks += self.callbacks.get(
