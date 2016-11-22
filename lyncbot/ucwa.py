@@ -28,14 +28,6 @@ import ssl
 ssl._create_default_https_context = ssl._create_unverified_context
 ###
 
-# Things to do:
-# 2. Build an events system
-#    - refactor LyncUCWA.listen() to a process_events() call that:
-#      - takes each emitted event
-#      - walks down the self.application tree and updates the local data model
-#      - invokes any callbacks registered to individual elements of the model
-# 3. Build a callback system
-
 class DataHref(str):
     def __new__(cls, content):
         if content.startswith('data:'):
@@ -108,10 +100,8 @@ class UCWAResource(dict):
             self._stub = False
 
     def __eq__(self, o):
-        log.debug('testing eq')
         return self['_links']['self']['href'] == o['_links']['self']['href']
     def __ne__(self, o):
-        log.debug('testing ne')
         return self['_links']['self']['href'] != o['_links']['self']['href']
 
     def update(self, other):
@@ -218,7 +208,7 @@ class UCWAConversation:
                 "to": "sip:" + self.other[0],
                 "_links": {
                     "message": {
-                        "href": DataHref.from_str(message, encoding='base64').href()
+                        "href": DataHref.from_str(message).href()
                     }
                 }
             })
@@ -233,18 +223,13 @@ class UCWAConversation:
 
     def _inbound_message(self, u, event):
         # skip messages not for this conversation
-        log.debug('got message')
         if event.message.direction != 'Incoming':
-            log.debug('not incoming')
             return
         if self.conversation is None:
-            log.debug('no convo')
             return
         if event.message.messaging != self.conversation.messaging:
-            log.debug('not my messaging')
             return
         if self.inbound_callback is None:
-            log.debug('no callback')
             return
         
         try:
@@ -256,7 +241,6 @@ class UCWAConversation:
         except AttributeError:
             ev_message = event.message.plainMessage
         message = "%s: %s" % (sender, ev_message)
-        log.debug('wrote message: ' + repr(message))
         self.inbound_callback(message)
 
 
@@ -408,8 +392,7 @@ class LyncUCWA:
         def invite_callback(u, event):
             if event.messagingInvitation.direction != 'Incoming':
                 return
-            other = getattr(event.messagingInvitation, 'from')\
-                .uri.split(':')[1]
+            other = event.messagingInvitation.frm.uri.split(':')[1]
             event.messagingInvitation.accept(POST=True)
             conversation = UCWAConversation(u, [other])
             conversation.conversation = event.messagingInvitation.conversation
@@ -475,7 +458,7 @@ if __name__ == "__main__":
         l.register_callback(printer, 'communication', link_rel='communication')
 
         def accept_and_respond(u, event):
-            print(getattr(event.messagingInvitation, 'from').name)
+            print(event.messagingInvitation.frm.name)
             print(event.messagingInvitation.message)
             # respond with acceptance
             #http.client.HTTPConnection.debuglevel = 1
