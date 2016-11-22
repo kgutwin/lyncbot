@@ -12,7 +12,8 @@ log = logging.getLogger(__name__)
 try:
     from urllib.error import HTTPError, URLError
     from urllib.request import urlopen, Request
-    from urllib.parse import urlparse, urlunparse, urlencode
+    from urllib.parse import urlparse, urlunparse, urlencode, unquote_plus, \
+        quote_plus
 except ImportError:
     # for temporary py2/3 compatibility
     from urllib import urlencode
@@ -35,6 +36,59 @@ ssl._create_default_https_context = ssl._create_unverified_context
 #      - invokes any callbacks registered to individual elements of the model
 # 3. Build a callback system
 
+class DataHref(str):
+    def __new__(cls, content):
+        if content.startswith('data:'):
+            content_type, encoding, content = cls._decode(content)
+            new = str.__new__(cls, content)
+            new.content_type = content_type
+            new.encoding = encoding
+        else:
+            new = str.__new__(cls, content)
+            new.content_type = 'text/plain'
+            new.encoding = 'charset=utf8'
+        return new
+
+    @classmethod
+    def from_str(cls, content, content_type='text/plain',
+                 encoding='charset=utf8'):
+        new = cls(content)
+        new.content_type = content_type
+        new.encoding = encoding
+        return new
+    
+    @staticmethod
+    def _decode(orig):
+        assert orig.startswith('data:')
+        content_type, content = orig[5:].split(';', 1)
+        encoding, data = content.split(',', 1)
+        if encoding == 'base64':
+            decoded = base64.b64decode(data)
+        elif encoding.startswith('charset='):
+            # TODO: figure out exactly what's up with python charset handling
+            decoded = unquote_plus(data)
+        else:
+            raise Exception('no support yet for encoding %s' % encoding)
+        return content_type, encoding, decoded
+
+    def __repr__(self):
+        return "DataHref(%s)" % repr(self.href())
+
+    def plaintext(self):
+        if self.content_type == 'text/html':
+            return re.sub('\s+', ' ', re.sub('<[^>]*>', ' ', self)).strip()
+        return self
+
+    def href(self):
+        if self.encoding == 'base64':
+            encoded = base64.b64encode(self.encode('ascii')).decode('ascii')
+        elif self.encoding.startswith('charset='):
+            encoded = quote_plus(self)
+        else:
+            raise Exception('no support yet for encoding %s' % self.encoding)
+        return "data:%s;%s,%s" % (self.content_type, self.encoding, encoded)
+        
+    
 class UCWAResource(dict):
     # some links or properties map to Python reserved words; these are
     # synonyms.
@@ -48,9 +102,18 @@ class UCWAResource(dict):
         self._ucwa = kwargs['ucwa']
         if 'href' in kwargs:
             self.update({'_links': {'self': {'href': kwargs['href']}}})
+            self._stub = True
         else:
             self.update(args[0])
-        
+            self._stub = False
+
+    def __eq__(self, o):
+        log.debug('testing eq')
+        return self['_links']['self']['href'] == o['_links']['self']['href']
+    def __ne__(self, o):
+        log.debug('testing ne')
+        return self['_links']['self']['href'] != o['_links']['self']['href']
+
     def update(self, other):
         dict.update(self, other)
         for link in self.get('_links', {}):
@@ -60,9 +123,10 @@ class UCWAResource(dict):
             new_attr = None
             if href.startswith('/'):
                 new_attr = UCWAResource(href=href, ucwa=self._ucwa)
+                for key in self['_links'][link].keys() - set(['href']):
+                    new_attr[key] = self['_links'][link][key]
             elif href.startswith('data:'):
-                # TODO: decode data here
-                new_attr = href
+                new_attr = DataHref(href)
             if new_attr is not None:
                 setattr(self, link, new_attr)
                 if link in self.RESERVED_ALT:
@@ -77,8 +141,7 @@ class UCWAResource(dict):
                 setattr(self, embed, UCWAResource(value, ucwa=self._ucwa))
 
     def __getattr__(self, name):
-        if (list(self.keys()) == ['_links'] and
-            list(self['_links'].keys()) == ['self']):
+        if self._stub:
             # we're a stub, refresh before proceeding
             self.refresh()
         if name in self:
@@ -143,17 +206,19 @@ class UCWAConversation:
         self.conversation = None
         self.inbound_callback = None
         self.invite_message = None
+        self.ucwa.register_callback(self._inbound_message, 'conversation',
+                                    link_rel='message')
 
     def send(self, message):
         if self.conversation is not None:
             self.conversation.messaging.sendMessage(POST=message)
         else:
-            msg_b64 = base64.b64encode(message)
-            loc = ucwa.application.communication.startMessaging(POST={
+            loc = self.ucwa.application.communication.startMessaging(POST={
+                "operationId": "%x" % abs(hash(self)),
                 "to": "sip:" + self.other[0],
                 "_links": {
                     "message": {
-                        "href": "data:text/plain;base64,%s" % msg_b64
+                        "href": DataHref.from_str(message, encoding='base64').href()
                     }
                 }
             })
@@ -162,15 +227,36 @@ class UCWAConversation:
             invite = UCWAResource(href=loc, ucwa=self.ucwa)
             self.conversation = invite.conversation
             # TODO: if len(other) > 1, invite others
-            self.ucwa.register_callback(self._inbound_message, 'conversation',
-                                        link_rel='message')
 
     def set_inbound_callback(self, cb):
         self.inbound_callback = cb
 
     def _inbound_message(self, u, event):
-        sender = event.message.contact.name.split()[0]
-        message = "%s: %s" % (sender, event.message.plainMessage)
+        # skip messages not for this conversation
+        log.debug('got message')
+        if event.message.direction != 'Incoming':
+            log.debug('not incoming')
+            return
+        if self.conversation is None:
+            log.debug('no convo')
+            return
+        if event.message.messaging != self.conversation.messaging:
+            log.debug('not my messaging')
+            return
+        if self.inbound_callback is None:
+            log.debug('no callback')
+            return
+        
+        try:
+            sender = event.message.participant.title.split()[0]
+        except AttributeError:
+            sender = event.message.contact.name.split()[0]
+        try:
+            ev_message = event.message.htmlMessage.plaintext()
+        except AttributeError:
+            ev_message = event.message.plainMessage
+        message = "%s: %s" % (sender, ev_message)
+        log.debug('wrote message: ' + repr(message))
         self.inbound_callback(message)
 
 
@@ -207,7 +293,7 @@ class LyncUCWA:
                 headers['Content-Type'] = 'text/plain'
                 headers['Content-Length'] = len(data)
             data = bytes(data, 'utf-8')
-        return Request(url, data, headers=self.auth_headers)
+        return Request(url, data, headers=headers)
         
     def login(self, username, password):
         # Ping the user URL, expecting a 401 and address of oauth server
@@ -307,22 +393,26 @@ class LyncUCWA:
             hits = list(self.search(name))
         if not hits:
             raise Exception("couldn't find %s" % name)
-        hits = [h.email for h in hits]
+        hits = [h.emailAddresses[0] for h in hits]
         if len(hits) != 1:
             raise Exception("the name %s was ambiguous - found %s" %
                             (name, ", ".join(hits)))
         return hits[0]
 
     def new_conversation(self, other):
+        if not isinstance(other, list):
+            other = [other]
         return UCWAConversation(self, other)
 
     def set_invitation_callback(self, cb):
         def invite_callback(u, event):
+            if event.messagingInvitation.direction != 'Incoming':
+                return
             other = getattr(event.messagingInvitation, 'from')\
                 .uri.split(':')[1]
-            event.accept(POST=True)
-            conversation = UCWAConversation(u, other)
-            conversation.conversation = event.conversation
+            event.messagingInvitation.accept(POST=True)
+            conversation = UCWAConversation(u, [other])
+            conversation.conversation = event.messagingInvitation.conversation
             conversation.invite_message = event.messagingInvitation.message
             cb(conversation)
 
@@ -345,7 +435,8 @@ class LyncUCWA:
         for event in self.application.events():
             for sender in event['sender']:
                 for ev in sender['events']:
-                    log.debug("Event: %s rel=%s" % (repr(ev), sender['rel']))
+                    log.debug("Event: %s rel=%s" % (json.dumps(ev),
+                                                    sender['rel']))
                     ev = UCWAResource(ev, ucwa=self)
                     callbacks = self.callbacks.get(sender['rel'], [])
                     callbacks += self.callbacks.get(
@@ -357,9 +448,13 @@ class LyncUCWA:
         
     
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.DEBUG)
+
     import getpass
     username = input("Username (email): ")
     password = getpass.getpass()
+
+    import http
 
     #http_logger = urllib2.HTTPHandler(debuglevel=1)
     #opener = urllib2.build_opener(http_logger)
@@ -383,14 +478,15 @@ if __name__ == "__main__":
             print(getattr(event.messagingInvitation, 'from').name)
             print(event.messagingInvitation.message)
             # respond with acceptance
-            event.accept(POST=True)
-            event.messaging.sendMessage("Hi!")
+            #http.client.HTTPConnection.debuglevel = 1
+            event.messagingInvitation.accept(POST=True)
+            event.messagingInvitation.messaging.sendMessage(POST="Hi!")
         l.register_callback(accept_and_respond, 'communication',
                             link_rel='messagingInvitation',
                             ev_type='started')
 
         def print_conversation_state(u, event):
-            print(event.state)
+            print(event.conversation.state)
         l.register_callback(print_conversation_state,
                             'communication', link_rel='conversation')
         

@@ -48,7 +48,7 @@ class Lyncbot(BotPlugin, web.WebInterface):
             return
         message_text = message.body
         if message.body.startswith('@'):
-            dest, message_text = message.body.split(1)
+            dest, message_text = message.body.split(None, 1)
             other = self.conns[frm].normalize_contact(dest[1:])
             chat = self.chats[frm].get(other)
         else:
@@ -83,9 +83,12 @@ class Lyncbot(BotPlugin, web.WebInterface):
     def add_chat(self, chat, to):
         self.chats[to][chat.other[0]] = chat
         self.current_chat[to] = chat
-        self.send(to, "New conversation from %s:" % (", ".join(chat.other)))
-        if chat.invite_message:
-            self.send(to, chat.invite_message)
+        to_id = self.build_identifier(to)
+        self.send(to_id, "New conversation from %s:" % (", ".join(chat.other)))
+        #if chat.invite_message:
+        #    self.send(to_id, chat.invite_message)
+        chat.set_inbound_callback(
+            lambda m: self.inbound_chat_message(m, to_id))
 
     def get_from(self, message):
         frm = str(message.frm)
